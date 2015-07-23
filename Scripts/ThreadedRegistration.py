@@ -1,8 +1,10 @@
 import logging
+import argparse
 import numpy as np
 import scipy.signal
 import scipy.interpolate
 import scipy.fftpack
+import os
 
 import threading
 import Queue
@@ -11,7 +13,8 @@ logger = logging.getLogger('AORegistration.AOVideo')
 
 class RegisterMovie():
     """Class for NCC frame registration"""
-    def __init__(self,filename):
+    def __init__(self,filename,output_dir):
+        self.outdir = output_dir
         self.loadArray(filename)
         
     def loadArray(self,fname):
@@ -20,7 +23,7 @@ class RegisterMovie():
         fname - path to an npz file with keys frames and keyframe"""
         try:
             data=np.load(fname)
-        except e:
+        except Exception, e:
             logger.error('Failed loading file:{0} with error:{1}'.format(fname,str(e)))
             raise IOError
         self.data = data['data']
@@ -33,9 +36,10 @@ class RegisterMovie():
             nFrames = [0,]
         else:
             nFrames = xrange(self.data.shape[2])
+        max_num_frames = min(10,nFrames)
         
-        for i in nFrames:
-            t = ThreadedFrame(q, self.data[:,:,self.key_frame], 64)
+        for i in range(max_num_frames):
+            t = ThreadedFrame(q, self.data[:,:,self.key_frame], 16, self.outdir)
             t.setDaemon(True)
             t.start()
             
@@ -46,25 +50,32 @@ class RegisterMovie():
             
         
 class ThreadedFrame(threading.Thread):
+#class ThreadedFrame():
     """Threaded frame processing"""
-    def __init__(self,queue,keyframe,nstrips):
+    def __init__(self,queue,keyframe,nstrips, outdir):
         """
         queue object containing frames as ndarrays
         keyframe ndarray containing the keyframe
         nstrips int number of strips in each frame
         """
         threading.Thread.__init__(self)
+        logger.debug('frame proc started')
         self.queue = queue
         self.keyframe = keyframe
         self.nstrips = nstrips
+        self.outdir = outdir
         
     def run(self):
         #grab the frame from the queue
-        item = self.queue.get()
-        self.frameidx = item[0]
-        self.framedata = item[1]
-        self.proc_frame()
-        self.queue.task_done()
+        while 1:
+            try:
+                item = self.queue.get()
+                self.frameidx = item[0]
+                self.framedata = item[1]
+                self.proc_frame()
+                self.queue.task_done()
+            except:
+                break
         
     def proc_frame(self):
         logger.debug('Processing frame:%s',self.frameidx)
@@ -72,6 +83,7 @@ class ThreadedFrame(threading.Thread):
         xshifts=[]
         yshifts=[]
         yshifts_centered=[]
+        correlations=[]
         for iloc in xrange(len(strip_idx)-1):
             logger.debug('Frame %s, strip %s',self.frameidx,iloc)
             #Calculate the padding required
@@ -97,7 +109,7 @@ class ThreadedFrame(threading.Thread):
             #perform the correlation
             corr = scipy.signal.correlate2d(template, strip, mode='same')
             y,x = np.unravel_index(np.argmax(corr),corr.shape)
-            
+            correlations.append(corr[y,x])
             #Calculate the x,y shifts
             x = x  -template.shape[1]/2
             y = y - t_pad - ((template.shape[0] - (t_pad+b_pad))/2)
@@ -107,16 +119,18 @@ class ThreadedFrame(threading.Thread):
             
             strip_center= strip_idx[iloc] + ((strip_idx[iloc+1] - strip_idx[iloc])/2)
 
-            yshifts_centered.append(y+strip_center)
+            yshifts_centered.append(strip_center-y)
             
-        newimg = self.rebuildFrame(xshifts, yshifts_centered)
+        newimg = self.rebuildFrame(xshifts, yshifts_centered, transform=True)
         
-        np.savez('createdFile{0}.npz'.format(self.frameidx),
+        np.savez(os.path.join(self.outdir,'createdFile{0}.npz'.format(self.frameidx)),
+                 frameidx = self.frameidx,
                  strip_center = strip_center,
                  xshifts=xshifts,
                  yshifts=yshifts,
                  yshifts_centered=yshifts_centered,
-                 newimg=newimg)
+                 newimg=newimg,
+                 correlations=correlations)
         logger.debug('Done processing frame:%s',self.frameidx)
 
     def rebuildFrame(self, xshifts, yshifts, transform=False):
@@ -135,9 +149,10 @@ class ThreadedFrame(threading.Thread):
             
         #create interpolation functions
         old_x = np.linspace(0,self.framedata.shape[0] - 1,len(fit_y))
+        old_y = np.linspace(31,991,len(fit_y))
         new_x = np.arange(self.framedata.shape[0])
         
-        fy = scipy.interpolate.InterpolatedUnivariateSpline(x=old_x,y=fit_y)
+        fy = scipy.interpolate.InterpolatedUnivariateSpline(x=old_y,y=fit_y)
         fx = scipy.interpolate.InterpolatedUnivariateSpline(x=old_x,y=fit_x)        
 
         #create an array with the new x,y indices
@@ -147,7 +162,7 @@ class ThreadedFrame(threading.Thread):
         for y in range(1024):
             for x in range(1000):
                 idx[y,x,0]=fy(y)
-                idx[y,x,1]=fx(y) + x  
+                idx[y,x,1]=0-fx(y) + x  
                 
         #resample with the new indices
         newimg = scipy.ndimage.interpolation.map_coordinates(self.framedata,
@@ -158,12 +173,27 @@ class ThreadedFrame(threading.Thread):
         return newimg
     
 if __name__ == '__main__':
+    
+    parser = argparse.ArgumentParser(description='Register AO frames') 
+    parser.add_argument('source_file',help="Path to the source file")
+    parser.add_argument('output_dir',help="Path to the output directory")
+    parser.add_argument('-l','--logfile',default=None,help="Path to log file")
+    
+    args=parser.parse_args()
+    
     logger = logging.getLogger('AORegistration')
     formatter = logging.Formatter('%(module)s : %(levelname)s - %(message)s')
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)    
+ 
+    if args.logfile:
+        handler = logging.FileHandler(args.logfile)
+        handler.setFormatter(formatter)
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+    
+        logger.addHandler(handler)    
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     logger.debug('XXXXXX')
-    r = RegisterMovie('/home/tom/Documents/Projects/AO_Registration/Data/2frames.npz')
+    r = RegisterMovie(args.source_file,args.output_dir)
     r.launchThreads()

@@ -55,7 +55,7 @@ class VideoPosition(wx.Panel):
         self.sld_position.Max = data
 
     def __frameChange(self,data,extra1=None,extra2=None):
-        logger.info('frameChange event detected')
+        logger.debug('frameChange event detected')
         if data > self.sld_position.Max or data < 0:
             logger.error('Invalid position specified')
             raise ValueError
@@ -84,11 +84,11 @@ class VideoButtons(wx.Panel):
         self.SetSizer(sizer)
 
     def onForward(self,event):
-        logger.info('Frame forward click event')
+        logger.debug('Frame forward click event')
         pub.sendMessage('position_change', data='forward')
 
     def onBackward(self,event):
-        logger.info('Frame backward click event')
+        logger.debug('Frame backward click event')
         pub.sendMessage('position_change', data='backward')
 
 class VideoControl(wx.Panel):
